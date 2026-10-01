@@ -12,25 +12,56 @@ st.set_page_config(
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
+import time
+
 # ---------------- FUNCTIONS ---------------- #
 
+@st.cache_data(show_spinner=False)
 def extract_transcript_details(youtube_video_url, lang_code):
     try:
         video_id = youtube_video_url.split("v=")[1].split("&")[0]
 
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id, languages=[lang_code, 'en'])
+        # 1. Direct fetch (manual & standard captions)
+        try:
+            api = YouTubeTranscriptApi()
+            fetched = api.fetch(video_id, languages=[lang_code, 'en', 'en-US'])
+        except Exception:
+            # 2. Fallback: Search all manual & auto-generated tracks
+            try:
+                transcript_list = api.list(video_id)
+            except Exception:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+            try:
+                t_obj = transcript_list.find_transcript([lang_code, 'en', 'en-US'])
+            except Exception:
+                try:
+                    t_obj = transcript_list.find_generated_transcript([lang_code, 'en', 'en-US'])
+                except Exception:
+                    t_obj = next(iter(transcript_list))
+
+            fetched = t_obj.fetch()
 
         transcript = ""
         for snippet in fetched:
-            transcript += " " + snippet.text
+            text = snippet['text'] if isinstance(snippet, dict) else getattr(snippet, 'text', str(snippet))
+            transcript += " " + text
 
         return transcript
 
-    except:
+    except Exception:
         return None
 
 
+def chunk_text(text, max_words=5000):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), max_words):
+        chunks.append(" ".join(words[i : i + max_words]))
+    return chunks
+
+
+@st.cache_data(show_spinner=False)
 def generate_gemini_content(transcript_text, summary_type, language):
     
     # Model selection
@@ -75,10 +106,38 @@ Mode: Teach
 - Make it beginner friendly
 """
 
-    final_prompt = base_prompt + format_prompt + "\n\nTranscript:\n" + transcript_text
+    words = transcript_text.split()
+    max_words_per_chunk = 5000
 
-    response = model.generate_content(final_prompt)
-    return response.text
+    if len(words) <= max_words_per_chunk:
+        final_prompt = base_prompt + format_prompt + "\n\nTranscript:\n" + transcript_text
+        response = model.generate_content(final_prompt)
+        return response.text
+    else:
+        # Map-Reduce for long transcripts (> 30 mins)
+        chunks = chunk_text(transcript_text, max_words=max_words_per_chunk)
+        chunk_summaries = []
+
+        # Map Phase
+        for idx, chunk in enumerate(chunks):
+            map_prompt = (
+                f"Summarize section {idx+1}/{len(chunks)} of this video transcript concisely:\n\n{chunk}"
+            )
+            chunk_resp = model.generate_content(map_prompt)
+            chunk_summaries.append(f"--- Section {idx+1} Summary ---\n{chunk_resp.text}")
+            time.sleep(2) # 2s sleep to safely respect API rate limits
+
+        combined_summaries = "\n\n".join(chunk_summaries)
+
+        # Reduce Phase
+        reduce_prompt = (
+            base_prompt + format_prompt +
+            f"\n\nHere are summaries of different sections of a long video ({len(chunks)} sections total).\n"
+            f"Combine them into a single, cohesive, non-repetitive final output:\n\n"
+            + combined_summaries
+        )
+        response = model.generate_content(reduce_prompt)
+        return response.text
 
 
 # ---------------- UI ---------------- #
